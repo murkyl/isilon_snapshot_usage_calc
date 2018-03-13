@@ -1,6 +1,6 @@
 # -*- coding: utf8 -*-
-__date__       = "06 February 2018"
-__version__    = "1.0"
+__date__       = "13 March 2018"
+__version__    = "1.1"
 __license__    = "MIT"
 __status__     = "Beta"
 __author__     = "Andrew Chung"
@@ -8,7 +8,7 @@ __maintainer__ = "Andrew Chung"
 __email__      = "acchung@gmail.com"
 __credits__    = []
 __all__        = []
-__copyright__ = """Copyright 2017 Andrew Chung
+__copyright__ = """Copyright 2018 Andrew Chung
 Permission is hereby granted, free of charge, to any person obtaining a copy of 
 this software and associated documentation files (the "Software"), to deal in 
 the Software without restriction, including without limitation the rights to 
@@ -29,35 +29,19 @@ SOFTWARE."""
 import sys
 import platform
 import json
-import collections
 import logging
 import optparse
 import getpass
-import httplib
-from urlparse import urlunsplit
-from urlparse import urljoin
-from urllib import urlencode
-import ssl
 import re
+import papi_lite
 
 # Global logging object
 l = None
-# Flag to determine if we use internal API or actually perform HTTP request
-API_ONCLUSTER = 0
-# Cached user credentials for HTTP request
-USER = None
-PASSWORD = None
-SERVER = None
-SESSION = None
-MAX_RECORDS_LIMIT = 1000
-DEFAULT_API_TIMEOUT = 300
-URL_PAPI_SESSION = '/session/1/session'
-URL_PAPI_PLATFORM_PREFIX = '/platform/%s'
-URL_PAPI_SNAPSHOTS = '1/snapshot/snapshots'
+# Global PAPI state dictionary
+PAPI_STATE = {}
 
-if "OneFS" in platform.system():
-  API_ONCLUSTER = 1
-  import isi.rest
+MAX_RECORDS_LIMIT = 1000
+URL_PAPI_SNAPSHOTS = '1/snapshot/snapshots'
 
 
 def AddParserOptions(parser):
@@ -73,52 +57,44 @@ def AddParserOptions(parser):
                     default=None,
                     help="User password")
   parser.add_option("-s", "--server",
-                    default="127.0.0.1:8080",
-                    help="Server and port to connect. (default: %default)")
-  parser.add_option("-e", "--regex",
+                    default=None,
+                    help="Server and port to connect. If running on cluster you can use 127.0.0.1:8080")
+  group = optparse.OptionGroup(parser, "Matching and output options")
+  group.add_option("-e", "--regex",
                     action="store_true",
                     default=False,
                     help="Enable regular expression path matching instead of exact string match.")
-  parser.add_option("--base10",
+  group.add_option("--base10",
                     action="store_true",
                     default=False,
                     help="Enable size output in base 10 units instead of base 2 SI units.")
-  parser.add_option("--bytes",
+  group.add_option("--bytes",
                     action="store_true",
                     default=False,
                     help="Output size in bytes.")
-  parser.add_option("--precision",
+  group.add_option("--precision",
                     default=2,
                     help="Number of decimal places of precision for size output.")
-  parser.add_option("-l", "--log",
+  parser.add_option_group(group)
+  group = optparse.OptionGroup(parser, "Logging and debug options")
+  group.add_option("-l", "--log",
                     default=None,
                     help="Full path and file name for log output.  If not set"
                       "no log output to file will be generated.")
-  parser.add_option("--console_log",
+  group.add_option("--console_log",
                     action="store_true",
                     default=False,
                     help="When this flag is set, log output to console. (Default: True if no other logging enabled and quiet is False)")
-  parser.add_option("-q", "--quiet",
+  group.add_option("-q", "--quiet",
                     action="store_true",
                     default=False,
                     help="When this flag is set, do not log output to console.")
-  parser.add_option("--debug",
+  group.add_option("--debug",
                     default=0,
                     action="count",
                     help="Add multiple debug flags to increase debug. Warning are printed automatically unless suppressed by --quiet.\n"
                       "1: Info, 2: Debug")
-
-def convert(data):
-  """Changes any unicode strings in the input data to utf-8 strings. This does
-  recursively go through the data structure."""
-  if isinstance(data, basestring):
-    return str(data)
-  elif isinstance(data, collections.Mapping):
-    return dict(map(convert, data.iteritems()))
-  elif isinstance(data, collections.Iterable):
-    return type(data)(map(convert, data))
-  else:
-    return data
+  parser.add_option_group(group)
 
 def humanize_number(num, suffix='B', base=10, precision=2):
   """Changes a number into a human friendly output using units
@@ -143,123 +119,6 @@ def humanize_number(num, suffix='B', base=10, precision=2):
     bin_mark = 'i'
   return '{0:0.{1}f} {2}{3}{4}'.format(num, precision, unit, bin_mark, suffix)
   
-def get_papi_session(server, user, password):
-  """Connects to a OneFS cluster and gets a PAPI session cookie"""
-  headers = {"Content-type": "application/json", "Accept": "application/json"}
-  conn = httplib.HTTPSConnection(server)
-  data = json.dumps({'username': user, 'password': password, 'services': ['platform']})
-  try:
-    conn.request('POST', URL_PAPI_SESSION, data, headers)
-  except IOError as ioe:
-    if ioe.errno == 61:
-      l.critical("Could not connect to the server. Check the URL including port number. Port 8080 is default.")
-      sys.exit(2)
-  except Exception as e:
-    l.exception(e)
-    sys.exit(3)
-  resp = conn.getresponse()
-  l.debug(resp.read())
-  l.debug(resp.getheaders())
-  cookie = resp.getheader('set-cookie')
-  conn.close()
-  return (cookie.split(';')[0])
-
-def rest_call(url, method=None, query_args=None, headers=None, body=None, timeout=DEFAULT_API_TIMEOUT):
-  """Perform a REST call either using HTTPS or when run on an Isilon cluster,
-  use the internal PAPI socket path.
-  
-  url: Can be a full URL string with slashes or an array of string with no slashes
-  method: HTTP method. GET, POST, PUT, DELETE, etc.
-  query_args: Dictionary of key value pairs to be appended to the URL
-  headers: Optional dictionary used to override HTTP headers
-  body: Data to be put into the request body
-  timeout: Number of seconds to wait for command to complete. Only used for the
-    internal REST call"""
-  global API_ONCLUSTER
-  global USER
-  global PASSWORD
-  global SESSION
-  global SERVER
-  
-  resume = True
-  response_list = []
-  method = 'GET' if not method else method
-  query_args = {} if not query_args else convert(query_args)
-  headers = {} if not headers else headers
-  body = '' if not body else body
-  remote_url = url
-  l.debug("REST Call params: Method: %s / Query Args: %s / URL: %s"%(method, json.dumps(query_args), remote_url))
-  if isinstance(url, (unicode, str)):
-    remote_url = url.split('/')
-  if API_ONCLUSTER:
-    l.debug("On cluster query")
-    while resume:
-      data = isi.rest.send_rest_request(
-        socket_path = isi.rest.PAPI_SOCKET_PATH,
-        method = method,
-        uri = remote_url,
-        query_args = query_args,
-        headers = headers,
-        body = body,
-        timeout = timeout)
-      if data and data[0] >= 200 and data[0] < 300:
-        l.debug("REST call response: %s"%data[0])
-        resume = json.loads(data[2])['resume']
-        l.debug("Resume key: %s"%resume)
-        query_args = {'resume': str(resume) or ''}
-        response_list.append(data)
-      else:
-        resume = False
-        raise Exception("Error occurred getting data from cluster. Error code: %d"%data[0])
-  else:
-    l.debug("HTTPS query")
-    try:
-      if SESSION is None:
-        SESSION = get_papi_session(SERVER, USER, PASSWORD)
-      headers["Cookie"] = SESSION
-      headers["Content-type"] = "application/json"
-      headers["Accept"] = "application/json"
-      while resume:
-        url = urlunsplit(['', '', URL_PAPI_PLATFORM_PREFIX%'/'.join(remote_url), urlencode(query_args), None])
-        l.debug("Method: %s"%method)
-        l.debug("URL: %s"%url)
-        l.debug("Headers: %s"%headers)
-        # Send request over HTTPS
-        conn = httplib.HTTPSConnection(SERVER)
-        conn.request(method, url, body, headers=headers)
-        resp = conn.getresponse()
-        l.debug("HTTPS Response code: %d"%resp.status)
-        if resp and resp.status >= 200 and resp.status < 300:
-          l.debug("HTTPS call response: %s"%resp.status)
-          data = resp.read()
-          resume = json.loads(data)['resume']
-          l.debug("Resume key: %s"%resume)
-          query_args = {'resume': str(resume) or ''}
-          response_list.append([resp.status, resp.reason, data])
-        else:
-          resume = False
-          raise Exception("Error occurred getting data from cluster. Error code: %d"%resp.status)
-      conn.close()
-    except IOError as ioe:
-      if ioe.errno == 111:
-        raise Exception("Could not connect to server: %s. Check address and port."%SERVER)
-  # Combine multiple responses into 1
-  response = response_list[0]
-  try:
-    json_data = json.loads(response[2])
-  except:
-    json_data = ''
-  if len(response_list) > 1:
-    keys = json_data.keys()
-    keys.remove('total')
-    keys.remove('resume')
-    if len(keys) > 1:
-      raise Exception("More keys remaining in REST call response than we expected: %s"%keys)
-    key = keys[0]
-    for i in range(1, len(response_list)):
-      json_data[key] = json_data[key] + json.loads(response_list[i][2])[key]
-  return (response[0], response[1], json_data)
-
 def calc_snap_size(snaps_list, base10=False):
   """Take a list of snapshots and returns the total size of all the snapshots in the list"""
   snap_size = 0
@@ -267,14 +126,14 @@ def calc_snap_size(snaps_list, base10=False):
     snap_size = snap_size + int(snap['size'])
   return snap_size
 
-def get_snapshots(path, re_enable=False):
+def get_snapshots(state, path, re_enable=False):
   """Returns all snapshots on the system in an array"""
   snaps = []
   q_args = {
     'state': 'active',
     'limit': str(MAX_RECORDS_LIMIT),
   }
-  response = rest_call(URL_PAPI_SNAPSHOTS, query_args=q_args)
+  response = papi_lite.rest_call(state, URL_PAPI_SNAPSHOTS, query_args=q_args)
   l.debug(response)
   if response and response[0] == 200:
     json_data = response[2]
@@ -294,12 +153,9 @@ def get_snapshots(path, re_enable=False):
   
 def main():
   global l
-  global USER
-  global PASSWORD
-  global SERVER
-  global API_ONCLUSTER
+  global PAPI_STATE
   
-  USAGE =  "usage: %prog [options]"
+  USAGE =  "usage: %prog [options] PATH_OR_REGEX..."
   DEFAULT_LOG_FORMAT = '%(asctime)s - %(module)s|%(funcName)s - %(levelname)s [%(lineno)d] %(message)s'
   
   # Create our command line parser. We use the older optparse library for compatibility on OneFS
@@ -308,6 +164,9 @@ def main():
   (options, args) = parser.parse_args(sys.argv[1:])
   if (options.log is None) and (not options.quiet):
     options.console_log = True
+  if len(args) == 0:
+    parser.print_help()
+    parser.error("incorrect number of arguments")
     
   # Setup logging
   l = logging.getLogger()
@@ -329,23 +188,27 @@ def main():
   if (options.log is None) and (options.console_log is False):
     l.addHandler(logging.NullHandler())
   
-  if options.user:
-    API_ONCLUSTER = 0
-  if not API_ONCLUSTER:
+  papi_lite.init_papi_state(PAPI_STATE)
+  
+  if options.server:
+    PAPI_STATE['ONCLUSTER'] = False
+  elif "OneFS" in platform.system():
+    PAPI_STATE['ONCLUSTER'] = True
+  if not PAPI_STATE['ONCLUSTER']:
     if options.user:
-      USER = options.user
+      PAPI_STATE['USER'] = options.user
     else:
-      l.info("Using default user: %s\n"%USER)
-      USER = getpass.getuser()
+      l.info("Using default user: %s\n"%PAPI_STATE['USER'])
+      PAPI_STATE['USER'] = getpass.getuser()
     if options.password:
-      PASSWORD = options.password
+      PAPI_STATE['PASSWORD'] = options.password
     else:
-      PASSWORD = getpass.getpass()
-    SERVER = options.server
+      PAPI_STATE['PASSWORD'] = getpass.getpass()
+    PAPI_STATE['SERVER'] = options.server
 
   # Read all the snapshots
   for path in args:
-    snaps = get_snapshots(path, options.regex)
+    snaps = get_snapshots(PAPI_STATE, path, options.regex)
     l.debug("Total snaps matched: %d"%len(snaps))
     l.debug(snaps)
     snap_size = calc_snap_size(snaps, options.base10)
